@@ -26,7 +26,7 @@ os.environ["MPLCONFIGDIR"] = str(_MPL_DIR)
 
 import numpy as np
 from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import expm_multiply
+from scipy.sparse.linalg import expm_multiply, LinearOperator, onenormest
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -191,6 +191,36 @@ def precompute_paulis(n_sites, adj, k):
     return phases, rows_flat, cols_flat, num_paulis
 
 
+def precompute_pauli_specs(n_sites, adj, k):
+    """Compact Pauli specs for on-the-fly matvec — O(num_paulis) memory."""
+    subsets = enumerate_connected_subsets(n_sites, adj, k)
+    specs = []
+    for subset in subsets:
+        for pidx in product(range(3), repeat=len(subset)):
+            specs.append(list(zip(subset, pidx)))
+
+    num_paulis = len(specs)
+    flip_masks = np.empty(num_paulis, dtype=np.int64)
+    sign_masks = np.empty(num_paulis, dtype=np.int64)
+    base_phases = np.empty(num_paulis, dtype=complex)
+
+    for idx, spec in enumerate(specs):
+        fm, sm, num_y = 0, 0, 0
+        for qubit, pauli in spec:
+            bit_pos = n_sites - 1 - qubit
+            if pauli <= 1:  # X or Y → flip
+                fm |= 1 << bit_pos
+            if pauli >= 1:  # Y or Z → sign
+                sm |= 1 << bit_pos
+            if pauli == 1:  # Y → factor of i
+                num_y += 1
+        flip_masks[idx] = fm
+        sign_masks[idx] = sm
+        base_phases[idx] = 1j ** num_y
+
+    return flip_masks, sign_masks, base_phases, num_paulis
+
+
 # ── Build sparse Hamiltonian ─────────────────────────────────────────
 
 def build_sparse_H(phases, rows_flat, cols_flat, g, d):
@@ -199,9 +229,111 @@ def build_sparse_H(phases, rows_flat, cols_flat, g, d):
     return csr_matrix((vals, (rows_flat, cols_flat)), shape=(d, d))
 
 
+def build_hamiltonian_linop(flip_masks, sign_masks, base_phases, g, n_sites):
+    """LinearOperator for H via on-the-fly matvec.  O(d) working memory."""
+    d = 1 << n_sites
+    norm = np.sqrt(len(g))
+    weighted = (g / norm) * base_phases
+
+    b = np.arange(d, dtype=np.int64)
+
+    # Group Paulis by flip_mask so the gather v[b^fm] is done once per group
+    groups = {}
+    for p in range(len(flip_masks)):
+        fm = int(flip_masks[p])
+        if fm not in groups:
+            groups[fm] = []
+        groups[fm].append(p)
+
+    def _apply_H(v):
+        out = np.zeros(d, dtype=complex)
+        for fm, indices in groups.items():
+            b_src = b ^ fm
+            v_src = v[b_src]
+            acc = np.zeros(d, dtype=complex)
+            for p in indices:
+                sm = int(sign_masks[p])
+                # Bit-parallel parity: (-1)^popcount(b_src & sm)
+                x = b_src & sm
+                x ^= x >> 16
+                x ^= x >> 8
+                x ^= x >> 4
+                x ^= x >> 2
+                x ^= x >> 1
+                acc += weighted[p] * (1 - 2 * (x & 1))
+            out += acc * v_src
+        return out
+
+    def matvec(v):
+        return _apply_H(v)
+
+    def rmatvec(v):
+        return np.conj(_apply_H(np.conj(v)))
+
+    return LinearOperator((d, d), matvec=matvec, rmatvec=rmatvec, dtype=complex)
+
+
+def krylov_expm_multiply(H_matvec, v, t, m=30):
+    """Compute exp(-i*t*H) @ v using Lanczos iteration for Hermitian H.
+
+    Runs m Lanczos steps on H to build a real symmetric tridiagonal
+    approximation T, then computes exp(-i*t*T) on the small matrix exactly.
+
+    Args:
+        H_matvec: callable, computes H @ x  (H must be Hermitian)
+        v: starting vector (1-D complex array)
+        t: scalar time parameter
+        m: number of Lanczos steps (controls accuracy)
+
+    Returns:
+        Approximation to exp(-i*t*H) @ v
+    """
+    from scipy.linalg import expm as _dense_expm
+
+    n = len(v)
+    m = min(m, n)
+
+    V = np.zeros((m + 1, n), dtype=complex)
+    alpha = np.zeros(m, dtype=float)
+    beta = np.zeros(m, dtype=float)
+
+    norm_v = np.linalg.norm(v)
+    if norm_v == 0:
+        return np.zeros_like(v)
+    V[0] = v / norm_v
+
+    actual_m = m
+    for j in range(m):
+        w = H_matvec(V[j])
+        alpha[j] = np.real(np.vdot(V[j], w))
+        w -= alpha[j] * V[j]
+        if j > 0:
+            w -= beta[j - 1] * V[j - 1]
+        # Re-orthogonalise for numerical stability
+        for i in range(j + 1):
+            coeff = np.vdot(V[i], w)
+            w -= coeff * V[i]
+        beta[j] = np.linalg.norm(w)
+        if beta[j] < 1e-14:
+            actual_m = j + 1
+            break
+        V[j + 1] = w / beta[j]
+    else:
+        actual_m = m
+
+    # Build real symmetric tridiagonal and exponentiate with -i*t
+    T = np.diag(alpha[:actual_m])
+    if actual_m > 1:
+        T += np.diag(beta[:actual_m - 1], 1) + np.diag(beta[:actual_m - 1], -1)
+    eT = _dense_expm(-1j * t * T)
+
+    return norm_v * (V[:actual_m].T @ eT[:, 0])
+
+
 # ── Main experiment loop ─────────────────────────────────────────────
 
-def run_experiment(label, n_sites, adj, k, times, num_samples, rng):
+def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
+                   lanczos_m=30):
     d = 1 << n_sites
     T = len(times)
     t_start, t_stop = times[0], times[-1]
@@ -209,9 +341,26 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng):
     pr(f"  {label}: n={n_sites}, d={d}")
 
     t_pre = timer.time()
-    phases, rows_flat, cols_flat, num_paulis = precompute_paulis(n_sites, adj, k)
-    precomp_s = timer.time() - t_pre
-    pr(f"    |P_k|={num_paulis},  precomp {precomp_s:.2f}s")
+
+    # Estimate memory for dense precompute to choose approach
+    subsets = enumerate_connected_subsets(n_sites, adj, k)
+    num_paulis_est = sum(3 ** len(s) for s in subsets)
+    dense_bytes = num_paulis_est * d * 40
+    use_dense = dense_bytes < 2_000_000_000  # 2 GB threshold
+
+    if use_dense:
+        phases, rows_flat, cols_flat, num_paulis = precompute_paulis(
+            n_sites, adj, k
+        )
+        precomp_s = timer.time() - t_pre
+        pr(f"    |P_k|={num_paulis},  precomp {precomp_s:.2f}s  [sparse]")
+    else:
+        flip_masks, sign_masks, base_phases, num_paulis = (
+            precompute_pauli_specs(n_sites, adj, k)
+        )
+        precomp_s = timer.time() - t_pre
+        pr(f"    |P_k|={num_paulis},  precomp {precomp_s:.2f}s  [on-the-fly]")
+        pr(f"    (dense precompute would need {dense_bytes / 1e9:.1f} GB)")
 
     psi0 = np.zeros(d, dtype=complex)
     psi0[0] = 1.0
@@ -221,15 +370,30 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng):
     t0 = timer.time()
     for s in range(num_samples):
         g = rng.standard_normal(num_paulis)
-        H = build_sparse_H(phases, rows_flat, cols_flat, g, d)
 
-        # Krylov time evolution: exp(-i t H)|0>  for t in times
-        psi_all = expm_multiply(-1j * H, psi0,
-                                start=t_start, stop=t_stop,
-                                num=T, endpoint=True)   # (T, d)
-        probs = np.abs(psi_all) ** 2
-
-        cp_all[s] = np.sum(probs ** 2, axis=1)
+        if use_dense:
+            H = build_sparse_H(phases, rows_flat, cols_flat, g, d)
+            psi_all = expm_multiply(
+                -1j * H, psi0,
+                start=t_start, stop=t_stop, num=T, endpoint=True,
+            )
+            probs = np.abs(psi_all) ** 2
+            cp_all[s] = np.sum(probs ** 2, axis=1)
+        else:
+            H_op = build_hamiltonian_linop(
+                flip_masks, sign_masks, base_phases, g, n_sites,
+            )
+            psi = psi0.copy()
+            for t_idx in range(T):
+                t_now = times[t_idx]
+                t_prev = times[t_idx - 1] if t_idx > 0 else 0.0
+                dt = t_now - t_prev
+                if dt > 0:
+                    psi = krylov_expm_multiply(
+                        H_op.matvec, psi, dt, m=lanczos_m,
+                    )
+                probs = np.abs(psi) ** 2
+                cp_all[s, t_idx] = np.sum(probs ** 2)
 
         if (s + 1) % max(1, num_samples // 10) == 0:
             pr(f"    {s + 1}/{num_samples}  ({timer.time() - t0:.1f}s)")
