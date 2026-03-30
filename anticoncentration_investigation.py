@@ -25,6 +25,7 @@ os.environ["XDG_CACHE_HOME"] = str(_CACHE_DIR)
 os.environ["MPLCONFIGDIR"] = str(_MPL_DIR)
 
 import numpy as np
+import numba
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import expm_multiply, LinearOperator, onenormest
 import matplotlib
@@ -229,40 +230,48 @@ def build_sparse_H(phases, rows_flat, cols_flat, g, d):
     return csr_matrix((vals, (rows_flat, cols_flat)), shape=(d, d))
 
 
+@numba.njit(parallel=True, cache=True)
+def _apply_H_numba(v_re, v_im, flip_masks, sign_masks, w_re, w_im, n_sites):
+    d = numba.int64(1) << numba.int64(n_sites)
+    num_paulis = len(flip_masks)
+    out_re = np.zeros(d, dtype=np.float64)
+    out_im = np.zeros(d, dtype=np.float64)
+    for b in numba.prange(d):
+        re = 0.0
+        im = 0.0
+        for p in range(num_paulis):
+            b_src = b ^ flip_masks[p]
+            x = b_src & sign_masks[p]
+            x ^= x >> 16
+            x ^= x >> 8
+            x ^= x >> 4
+            x ^= x >> 2
+            x ^= x >> 1
+            sign = 1 - 2 * (x & 1)
+            vr = v_re[b_src]
+            vi = v_im[b_src]
+            wr = w_re[p]
+            wi = w_im[p]
+            re += sign * (wr * vr - wi * vi)
+            im += sign * (wr * vi + wi * vr)
+        out_re[b] = re
+        out_im[b] = im
+    return out_re, out_im
+
+
 def build_hamiltonian_linop(flip_masks, sign_masks, base_phases, g, n_sites):
-    """LinearOperator for H via on-the-fly matvec.  O(d) working memory."""
+    """LinearOperator for H via on-the-fly matvec (numba-accelerated)."""
     d = 1 << n_sites
     norm = np.sqrt(len(g))
     weighted = (g / norm) * base_phases
-
-    b = np.arange(d, dtype=np.int64)
-
-    # Group Paulis by flip_mask so the gather v[b^fm] is done once per group
-    groups = {}
-    for p in range(len(flip_masks)):
-        fm = int(flip_masks[p])
-        if fm not in groups:
-            groups[fm] = []
-        groups[fm].append(p)
+    w_re = np.ascontiguousarray(weighted.real)
+    w_im = np.ascontiguousarray(weighted.imag)
+    fm = np.ascontiguousarray(flip_masks)
+    sm = np.ascontiguousarray(sign_masks)
 
     def _apply_H(v):
-        out = np.zeros(d, dtype=complex)
-        for fm, indices in groups.items():
-            b_src = b ^ fm
-            v_src = v[b_src]
-            acc = np.zeros(d, dtype=complex)
-            for p in indices:
-                sm = int(sign_masks[p])
-                # Bit-parallel parity: (-1)^popcount(b_src & sm)
-                x = b_src & sm
-                x ^= x >> 16
-                x ^= x >> 8
-                x ^= x >> 4
-                x ^= x >> 2
-                x ^= x >> 1
-                acc += weighted[p] * (1 - 2 * (x & 1))
-            out += acc * v_src
-        return out
+        ore, oim = _apply_H_numba(v.real.copy(), v.imag.copy(), fm, sm, w_re, w_im, n_sites)
+        return ore + 1j * oim
 
     def matvec(v):
         return _apply_H(v)
