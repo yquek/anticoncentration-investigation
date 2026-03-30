@@ -19,7 +19,7 @@ def main():
     nx, ny = 5, 5
     k = 2
     seed = 42
-    lanczos_m = 40
+    lanczos_m = 15
     num_samples = 5
     times = np.arange(0, 21, dtype=float)  # t = 0, 1, ..., 20
 
@@ -39,21 +39,41 @@ def main():
     )
     pr(f"  |P_k| = {num_paulis}, took {timer.time() - t0:.2f}s")
 
-    # Benchmark a single matvec
-    pr("\nBenchmarking single matvec...")
-    g_test = rng.standard_normal(num_paulis)
-    H_test = build_hamiltonian_linop(flip_masks, sign_masks, base_phases, g_test, n_sites)
-    v_test = np.random.randn(d) + 1j * np.random.randn(d)
-    v_test /= np.linalg.norm(v_test)
+    # Warm up numba JIT on a small problem
+    pr("\nWarming up numba JIT...")
+    from anticoncentration_investigation import square_lattice as _sl
+    _n, _adj = _sl(2, 2)
+    _fm, _sm, _bp, _np = precompute_pauli_specs(_n, _adj, 2)
+    _g = np.random.default_rng(0).standard_normal(_np)
+    _H = build_hamiltonian_linop(_fm, _sm, _bp, _g, _n)
+    _H.matvec(np.ones(1 << _n, dtype=complex))
+    pr("  JIT compiled.")
 
+    # Benchmark matvec on actual problem size
+    pr("\nBenchmarking matvec on 5x5...")
+    g_bench = rng.standard_normal(num_paulis)
+    H_bench = build_hamiltonian_linop(flip_masks, sign_masks, base_phases, g_bench, n_sites)
+    v_bench = np.random.randn(d) + 1j * np.random.randn(d)
+    v_bench /= np.linalg.norm(v_bench)
     t0 = timer.time()
-    _ = H_test.matvec(v_test)
+    _ = H_bench.matvec(v_bench)
     matvec_s = timer.time() - t0
     pr(f"  Single matvec: {matvec_s:.2f}s")
-    pr(f"  Estimated per Lanczos step (m={lanczos_m}): ~{matvec_s:.1f}s matvec + reorth")
-    pr(f"  Estimated per time step: ~{matvec_s * lanczos_m:.0f}s")
-    pr(f"  Estimated per sample ({T} steps): ~{matvec_s * lanczos_m * T:.0f}s")
-    pr(f"  Estimated total ({num_samples} samples): ~{matvec_s * lanczos_m * T * num_samples:.0f}s")
+
+    # Estimate: each Lanczos step = 1 matvec + reorthog (~30% overhead)
+    step_s = matvec_s * 1.3
+    time_step_s = step_s * lanczos_m
+    sample_s_est = time_step_s * (T - 1)  # t=0 needs no evolution
+    total_s_est = sample_s_est * num_samples
+    pr(f"\n  === TIMING ESTIMATES ===")
+    pr(f"  Per Lanczos step:  ~{step_s:.1f}s")
+    pr(f"  Per time step:     ~{time_step_s:.0f}s ({time_step_s/60:.1f} min)")
+    pr(f"  Per sample ({T-1} evolve steps): ~{sample_s_est:.0f}s ({sample_s_est/60:.1f} min)")
+    pr(f"  Total ({num_samples} samples):  ~{total_s_est:.0f}s ({total_s_est/3600:.1f} hrs)")
+    pr(f"  =========================\n")
+
+    # Reset RNG for reproducibility (benchmark consumed one draw)
+    rng = np.random.default_rng(seed)
 
     psi0 = np.zeros(d, dtype=complex)
     psi0[0] = 1.0
@@ -72,28 +92,37 @@ def main():
             t_now = times[t_idx]
             t_prev = times[t_idx - 1] if t_idx > 0 else 0.0
             dt = t_now - t_prev
+            t_step = timer.time()
             if dt > 0:
                 psi = krylov_expm_multiply(H_op.matvec, psi, dt, m=lanczos_m)
             probs = np.abs(psi) ** 2
             cp_all[s, t_idx] = np.sum(probs ** 2)
-
             norm = np.linalg.norm(psi)
-            pr(f"  sample {s+1}/{num_samples}  t={t_now:.0f}  "
-               f"d*CP={d * cp_all[s, t_idx]:.4f}  |psi|={norm:.10f}  "
-               f"({timer.time() - t_sample:.1f}s)")
+            elapsed_sample = timer.time() - t_sample
+            elapsed_total = timer.time() - t_total
+            steps_done = s * (T - 1) + max(t_idx, 0)
+            steps_total = num_samples * (T - 1)
+            if steps_done > 0:
+                eta = elapsed_total / steps_done * (steps_total - steps_done)
+            else:
+                eta = total_s_est
+            pr(f"  sample {s+1}/{num_samples}  t={t_now:2.0f}  "
+               f"d*CP={d * cp_all[s, t_idx]:10.4f}  |psi|={norm:.10f}  "
+               f"step={timer.time()-t_step:.1f}s  "
+               f"elapsed={elapsed_total:.0f}s  ETA={eta:.0f}s ({eta/60:.1f}min)")
 
-        pr(f"  Sample {s+1} done in {timer.time() - t_sample:.1f}s")
+        pr(f"  --- Sample {s+1} done in {timer.time() - t_sample:.1f}s ---")
 
     total_s = timer.time() - t_total
-    pr(f"\nAll samples done in {total_s:.1f}s")
+    pr(f"\nAll samples done in {total_s:.1f}s ({total_s/3600:.2f} hrs)")
 
     norm_cp = d * np.mean(cp_all, axis=0)
     norm_cp_err = d * np.std(cp_all, axis=0) / np.sqrt(num_samples)
 
-    pr(f"\n{'t':>4s}  {'d*CP':>10s}  {'err':>10s}")
-    pr("-" * 30)
+    pr(f"\n{'t':>4s}  {'d*CP':>12s}  {'err':>12s}")
+    pr("-" * 34)
     for i, t in enumerate(times):
-        pr(f"{t:4.0f}  {norm_cp[i]:10.4f}  {norm_cp_err[i]:10.4f}")
+        pr(f"{t:4.0f}  {norm_cp[i]:12.4f}  {norm_cp_err[i]:12.4f}")
 
     results = {
         "lattice": f"{nx}x{ny}",
