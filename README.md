@@ -1,6 +1,6 @@
 # Exact Anticoncentration Investigation
 
-This repo contains the exact collision-probability calculation for random geometrically local Hamiltonian time evolution on 2D square lattices.
+This repo contains exact collision-probability calculations for random geometrically local Hamiltonian time evolution on 2D square lattices, together with dedicated runners for selected 3D cubic lattices.
 
 The main script is `anticoncentration_investigation.py`. It computes
 
@@ -14,7 +14,7 @@ for
 - `H = (1 / sqrt(|P_k|)) sum_{P in P_k} g_P P`
 - `g_P ~ N(0, 1)` i.i.d.
 
-where `P_k` is the set of geometrically local Pauli terms on the chosen 2D square lattice.
+where `P_k` is the set of geometrically local Pauli terms on the chosen lattice geometry.
 
 ## Requirements
 
@@ -101,6 +101,21 @@ python anticoncentration_investigation.py \
   --t-max 5 \
   --num-times 6
 ```
+
+Run the dedicated exact 3D `3x3x3` collision-probability job:
+
+```bash
+python run_3x3x3.py
+```
+
+This uses:
+
+- `3D 3x3x3`
+- `k = 2`
+- `t = 0, 1, ..., 20`
+- `4` Hamiltonian samples
+
+and writes `results_3x3x3_t20.json`.
 
 ## Important Note On Scaling
 
