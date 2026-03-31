@@ -115,7 +115,15 @@ This uses:
 - `t = 0, 1, ..., 20`
 - `4` Hamiltonian samples
 
-and writes `results_3x3x3_t20.json`.
+and writes `results_3x3x3_t20.json`, including compact final-time histogram data for the Porter-Thomas check.
+
+To render the collision-probability curve together with the final-time histogram:
+
+```bash
+python plot_3x3x3.py
+```
+
+This writes `anticoncentration_3x3x3_t20.png`.
 
 ## Important Note On Scaling
 
