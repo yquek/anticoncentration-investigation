@@ -8,6 +8,9 @@ from anticoncentration_investigation import (
     precompute_pauli_specs,
     build_hamiltonian_linop,
     krylov_expm_multiply,
+    init_histogram_accumulator,
+    accumulate_histogram,
+    serialise_histogram,
 )
 
 
@@ -22,6 +25,8 @@ def main():
     lanczos_m = 15
     num_samples = 5
     times = np.arange(0, 21, dtype=float)  # t = 0, 1, ..., 20
+    hist_bins = 100
+    hist_max = 8.0
 
     n_sites, adj = square_lattice(nx, ny)
     d = 1 << n_sites
@@ -78,6 +83,7 @@ def main():
     psi0 = np.zeros(d, dtype=complex)
     psi0[0] = 1.0
     cp_all = np.zeros((num_samples, T))
+    hist_acc = init_histogram_accumulator(d, times, hist_bins, hist_max)
 
     t_total = timer.time()
     for s in range(num_samples):
@@ -97,6 +103,8 @@ def main():
                 psi = krylov_expm_multiply(H_op.matvec, psi, dt, m=lanczos_m)
             probs = np.abs(psi) ** 2
             cp_all[s, t_idx] = np.sum(probs ** 2)
+            if t_idx in hist_acc["indices"]:
+                accumulate_histogram(hist_acc, t_idx, probs)
             norm = np.linalg.norm(psi)
             elapsed_sample = timer.time() - t_sample
             elapsed_total = timer.time() - t_total
@@ -136,6 +144,7 @@ def main():
         "times": times.tolist(),
         "norm_cp": norm_cp.tolist(),
         "norm_cp_err": norm_cp_err.tolist(),
+        "histogram": serialise_histogram(hist_acc, times),
         "total_seconds": total_s,
     }
     out_path = "results_5x5.json"

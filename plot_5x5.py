@@ -6,6 +6,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from anticoncentration_investigation import histogram_density
+
 with open("results_5x5.json") as f:
     data = json.load(f)
 
@@ -17,8 +19,13 @@ n = data["n_sites"]
 d = data["d"]
 samples = data["num_samples"]
 label = f'2D {data["lattice"]}'
+histogram = data.get("histogram")
 
-fig, ax = plt.subplots(figsize=(10, 6))
+if histogram:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    ax = axes[0]
+else:
+    fig, ax = plt.subplots(figsize=(10, 6))
 
 cm = plt.colormaps["viridis"]
 color = cm(0.6)
@@ -37,6 +44,34 @@ ax.set_yscale("log")
 ax.set_ylim(1.5, None)
 ax.legend(fontsize=8, loc="upper right")
 ax.grid(True, alpha=0.3)
+
+if histogram:
+    ax_hist = axes[1]
+    scaled_edges = np.array(histogram["scaled_edges"], dtype=float)
+    final_key = max(histogram["snapshots"], key=int)
+    snapshot = histogram["snapshots"][final_key]
+    density = histogram_density(snapshot, scaled_edges)
+    ax_hist.stairs(density, scaled_edges, color=color, lw=1.6,
+                   label=f'{label},  t = {snapshot["time"]:.1f}')
+    xpt = np.linspace(0, scaled_edges[-1], 400)
+    ax_hist.plot(xpt, np.exp(-xpt), "k-", lw=2, label="Porter-Thomas")
+    ax_hist.set_xlabel(r"$d\,p_x$")
+    ax_hist.set_ylabel("Density")
+    ax_hist.set_title("(b)  Final-time output distribution")
+    ax_hist.set_xlim(0, scaled_edges[-1])
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(True, alpha=0.3)
+    overflow_frac = snapshot["overflow"] / snapshot["total"] if snapshot["total"] else 0.0
+    if overflow_frac > 0:
+        ax_hist.text(
+            0.98,
+            0.98,
+            f"Overflow > {scaled_edges[-1]:.1f}: {100 * overflow_frac:.3f}%",
+            transform=ax_hist.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+        )
 
 fig.suptitle(
     rf"Anticoncentration of $\mathcal{{E}}(k\!=\!{k})$ on 2-D square lattices (OBC)",

@@ -6,6 +6,7 @@ The main script is `anticoncentration_investigation.py`. It computes
 
 - `CP(t) = sum_x p_x(t)^2`
 - the normalized quantity `d * <CP(t)>`
+- binned histogram snapshots of `d p_x` for Porter-Thomas comparisons
 
 for
 
@@ -45,7 +46,7 @@ python anticoncentration_investigation.py \
 This produces:
 
 - a PNG plot of `d * <CP(t)>`
-- a JSON log with the time grid, per-lattice metadata, and the collision-probability curves
+- a JSON log with the time grid, per-lattice metadata, the collision-probability curves, and binned `d p_x` histogram snapshots
 
 ## How To Change The Problem Size
 
@@ -64,6 +65,10 @@ The main knobs are:
   Number of time points between `0` and `t-max`.
 - `--k`
   Locality parameter. The current default is `k = 2`.
+- `--hist-bins`
+  Number of bins used for the binned `d p_x` histogram snapshots.
+- `--hist-max`
+  Largest `d p_x` value retained in the histogram bins. Larger values are tracked via an overflow count.
 
 Examples:
 
@@ -118,5 +123,10 @@ The JSON log contains, for each requested shape:
 - sampling/runtime information
 - `norm_cp`
 - `norm_cp_err`
+- `histogram`
+  Compact binned Porter-Thomas histogram snapshots at four times: roughly
+  one quarter, one half, three quarters, and the final time. Each snapshot
+  stores bin edges, counts, total samples, and an overflow count above
+  `--hist-max`.
 
 The plot uses a fixed Haar reference line at `2`.

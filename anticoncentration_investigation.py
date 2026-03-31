@@ -82,6 +82,18 @@ def parse_args():
         default=Path("anticoncentration_2d_squares_t20.json"),
         help="Output JSON log path.",
     )
+    parser.add_argument(
+        "--hist-bins",
+        type=int,
+        default=100,
+        help="Number of bins for the binned d*p_x histogram snapshots.",
+    )
+    parser.add_argument(
+        "--hist-max",
+        type=float,
+        default=8.0,
+        help="Largest plotted value for the d*p_x histogram snapshots.",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +105,55 @@ def parse_sample_schedule(schedule):
         label, value = item.split(":", 1)
         result[label.strip()] = int(value)
     return result
+
+
+def select_histogram_indices(num_times):
+    return sorted(set([num_times // 4, num_times // 2, 3 * num_times // 4, num_times - 1]))
+
+
+def init_histogram_accumulator(d, times, hist_bins, hist_max):
+    hist_idx = select_histogram_indices(len(times))
+    scaled_edges = np.linspace(0.0, hist_max, hist_bins + 1)
+    prob_edges = scaled_edges / d
+    return {
+        "indices": hist_idx,
+        "scaled_edges": scaled_edges,
+        "prob_edges": prob_edges,
+        "counts": {ti: np.zeros(hist_bins, dtype=np.int64) for ti in hist_idx},
+        "overflow": {ti: 0 for ti in hist_idx},
+        "total": {ti: 0 for ti in hist_idx},
+    }
+
+
+def accumulate_histogram(acc, t_idx, probs):
+    counts, _ = np.histogram(probs, bins=acc["prob_edges"])
+    acc["counts"][t_idx] += counts
+    acc["overflow"][t_idx] += int(np.count_nonzero(probs > acc["prob_edges"][-1]))
+    acc["total"][t_idx] += probs.size
+
+
+def serialise_histogram(acc, times):
+    return {
+        "scaled_edges": acc["scaled_edges"].tolist(),
+        "snapshots": {
+            str(ti): {
+                "time": float(times[ti]),
+                "counts": acc["counts"][ti].tolist(),
+                "overflow": int(acc["overflow"][ti]),
+                "total": int(acc["total"][ti]),
+            }
+            for ti in acc["indices"]
+        },
+    }
+
+
+def histogram_density(snapshot, scaled_edges):
+    counts = np.asarray(snapshot["counts"], dtype=float)
+    widths = np.diff(scaled_edges)
+    total = snapshot["total"]
+    if total == 0:
+        return np.zeros_like(counts)
+    return counts / (total * widths)
 
 
 # ── Lattice helpers ──────────────────────────────────────────────────
@@ -342,7 +403,7 @@ def krylov_expm_multiply(H_matvec, v, t, m=30):
 # ── Main experiment loop ─────────────────────────────────────────────
 
 def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
-                   lanczos_m=30):
+                   hist_bins, hist_max, lanczos_m=30):
     d = 1 << n_sites
     T = len(times)
     t_start, t_stop = times[0], times[-1]
@@ -375,6 +436,7 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
     psi0[0] = 1.0
 
     cp_all = np.zeros((num_samples, T))
+    hist_acc = init_histogram_accumulator(d, times, hist_bins, hist_max)
 
     t0 = timer.time()
     for s in range(num_samples):
@@ -388,6 +450,8 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
             )
             probs = np.abs(psi_all) ** 2
             cp_all[s] = np.sum(probs ** 2, axis=1)
+            for t_idx in hist_acc["indices"]:
+                accumulate_histogram(hist_acc, t_idx, probs[t_idx])
         else:
             H_op = build_hamiltonian_linop(
                 flip_masks, sign_masks, base_phases, g, n_sites,
@@ -403,6 +467,8 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
                     )
                 probs = np.abs(psi) ** 2
                 cp_all[s, t_idx] = np.sum(probs ** 2)
+                if t_idx in hist_acc["indices"]:
+                    accumulate_histogram(hist_acc, t_idx, probs)
 
         if (s + 1) % max(1, num_samples // 10) == 0:
             pr(f"    {s + 1}/{num_samples}  ({timer.time() - t0:.1f}s)")
@@ -416,6 +482,7 @@ def run_experiment(label, n_sites, adj, k, times, num_samples, rng,
         "np_k": num_paulis,
         "precomp_s": precomp_s,
         "sample_s": sample_s,
+        "histogram": serialise_histogram(hist_acc, times),
     }
 
 
@@ -440,7 +507,10 @@ def main():
     for label, n_sites, adj, ns, shape in configs:
         pr(f"\n{'=' * 50}\n  {label}\n{'=' * 50}")
         t0 = timer.time()
-        out = run_experiment(label, n_sites, adj, args.k, times, ns, rng)
+        out = run_experiment(
+            label, n_sites, adj, args.k, times, ns, rng,
+            hist_bins=args.hist_bins, hist_max=args.hist_max,
+        )
         pr(f"  DONE  {timer.time() - t0:.1f}s total")
         out.update({"d": 1 << n_sites, "n": n_sites, "samples": ns, "shape": shape})
         results[label] = out
@@ -500,6 +570,7 @@ def main():
                 "sample_s": results[label]["sample_s"],
                 "norm_cp": results[label]["norm_cp"].tolist(),
                 "norm_cp_err": results[label]["norm_cp_err"].tolist(),
+                "histogram": results[label]["histogram"],
             }
             for label in labels_2d
         ],
